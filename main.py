@@ -96,9 +96,9 @@ async def connect_and_read_device_info() -> bool:
     global connect_lock
     if connect_lock:
         return
-    connect_lock = True
-    if view.selected_device is None:
+    if view.selected_device is None: # ignore double clicks on blank space
         return
+    connect_lock = True
 
     try:
         view.set_state("busy-connecting")
