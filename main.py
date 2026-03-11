@@ -8,7 +8,7 @@ from csv_module import CsvModule
 from typing import Literal
 from enum import Enum
 
-VERSION = "v1.1.0"
+VERSION = "v1.1.1"
 
 UUID_MODEL_INFO = "00002a24-0000-1000-8000-00805f9b34fb"
 UUID_SERIAL_NO = "00002a25-0000-1000-8000-00805f9b34fb"
@@ -500,7 +500,7 @@ async def delete_fingerprint() -> bool:
     finally:
         _mark_test_end()
         await bleak.stop_notify_silent(UUID_FINGERPRINT_DELETION)
-        log.log(f"[INFO] === Add Fingerprint end ===")
+        log.log(f"[INFO] === Delete Fingerprint end ===")
         if result_literal is not None:
             csv.update_results(fp_deletion=result_literal)
         if bleak.is_connected:
