@@ -31,21 +31,28 @@ FRAMERATE = 1 / 60
 view: View = None
 log: LogModule = None
 bleak: BleakModule = None
-csv_module: CsvModule | None = None
+csv: CsvModule | None = None
 
 fingerprint_storage: dict[str, str] = {}
 
-connect_lock: bool = False
+connect_lock: bool = False # ensures connect does not happen twice
 disconnect_expected = False
 test_abort_event: asyncio.Event | None = None
 tests_in_progress = 0
 
 
 class TestAbortedError(RuntimeError):
+    """Error wrapper (Custom)"""
     pass
 
+# ===============================================
+#  Test wait, abort Logic (disconnect/reconnect)
+# ===============================================
 
 def _mark_test_start() -> None:
+    """
+    Should be called at start of test
+    """
     global tests_in_progress
     tests_in_progress += 1
     if tests_in_progress == 1 and test_abort_event is not None:
@@ -53,11 +60,18 @@ def _mark_test_start() -> None:
 
 
 def _mark_test_end() -> None:
+    """
+    Should be called at end of test, usually on `finally` statements
+    """
     global tests_in_progress
     tests_in_progress = max(0, tests_in_progress - 1)
 
 
 def on_disconnect() -> None:
+    """
+    This function will run in BleakModule after it disconnects.
+    Handles view or main attributes that BleakModule cannot access.
+    """
     view.set_state('idle-disconnected')
     if tests_in_progress > 0 and test_abort_event is not None:
         if not test_abort_event.is_set():
@@ -66,11 +80,47 @@ def on_disconnect() -> None:
             test_abort_event.set()
 
 
+def on_reconnect() -> None:
+    """
+    This function will run in BleakModule after it reconnects.
+    Handles view or main attributes that BleakModule cannot access.
+    """
+    view.set_state("idle-connected")
+    view.clear_test_result()
+
+
+async def wait_or_abort(event: asyncio.Event) -> None:
+    """
+    Tests will await until the device is disconnected (goes to sleep) or the `event` is set.
+    """
+    if test_abort_event is None:
+        await event.wait()
+        return
+    if test_abort_event.is_set():
+        raise TestAbortedError()
+    if event.is_set():
+        return
+
+    done, pending = await asyncio.wait(
+        [asyncio.create_task(event.wait()), asyncio.create_task(test_abort_event.wait())],
+        return_when=asyncio.FIRST_COMPLETED,
+    )
+    for task in pending:
+        task.cancel()
+
+    if test_abort_event.is_set() and not event.is_set():
+        raise TestAbortedError()
+
+# ===============================================
+#  Main Logic
+#  - All functions returns a boolean that indicates test success/failure
+#  - tests are wrapped inside `try-except` statements.
+# ===============================================
+
 async def scan_and_update_device_list() -> bool:
     try:
         view.set_state("busy-scanning")
         view.clear_device_list()
-
         log.log(f"[INFO] Scanning...")
         await bleak.scan()
         filtered_devices = {
@@ -81,7 +131,6 @@ async def scan_and_update_device_list() -> bool:
         log.log(f"[INFO] Scan complete. Found {len(bleak.devices)} device(s)\n" \
                 + f" - Found {len(filtered_devices)} DekodaRemote(s)"
         )
-
         view.update_device_list(filtered_devices)
         view.set_state("idle-disconnected")
         return True
@@ -102,7 +151,6 @@ async def connect_and_read_device_info() -> bool:
 
     try:
         view.set_state("busy-connecting")
-
         name, address = view.selected_device
         recent_exc = None
         for idx in range(MAX_CONNECT_RETRY):
@@ -112,14 +160,10 @@ async def connect_and_read_device_info() -> bool:
                 break
             except Exception as exc:
                 recent_exc = exc
-        
         if not bleak.is_connected:
-            log.log(f"[ERROR] Connect failed with {name} ({address})")
             raise recent_exc
-
         log.log(f"[INFO] Connect complete with {name} ({address})")
-        if csv_module is not None:
-            csv_module.start_test(device_name=name, mac_address=address)
+        csv.start_test(device_name=name, mac_address=address)
         view.clear_device_list()
         view.clear_test_result()
         await asyncio.sleep(1.0)
@@ -140,16 +184,10 @@ async def connect_and_read_device_info() -> bool:
             view.set_state("idle-disconnected")
 
 
-def on_reconnect() -> None:
-    """
-    This function will run in BleakModule after it reconnects.
-    Handles view or main attributes that BleakModule cannot access
-    """
-    view.set_state("idle-connected")
-    view.clear_test_result()
-
-
 async def unpair_all_dekoda_remotes() -> bool:
+    """
+    Triggers when user presses "Dongle Reset"
+    """
     try:
         view.set_state("busy-unpairing")
         log.log("[INFO] Unpairing all...")
@@ -164,26 +202,6 @@ async def unpair_all_dekoda_remotes() -> bool:
         view.set_state("idle-disconnected")
         view.clear_device_info()
         view.clear_test_result()
-
-
-async def wait_or_abort(event: asyncio.Event) -> None:
-    if test_abort_event is None:
-        await event.wait()
-        return
-    if test_abort_event.is_set():
-        raise TestAbortedError()
-    if event.is_set():
-        return
-
-    done, pending = await asyncio.wait(
-        [asyncio.create_task(event.wait()), asyncio.create_task(test_abort_event.wait())],
-        return_when=asyncio.FIRST_COMPLETED,
-    )
-    for task in pending:
-        task.cancel()
-
-    if test_abort_event.is_set() and not event.is_set():
-        raise TestAbortedError()
 
 
 async def factory_reset_and_unpair() -> bool:
@@ -232,8 +250,8 @@ async def factory_reset_and_unpair() -> bool:
         await bleak.start_notify(UUID_FACTORY_RESET, callback=_cb)
         await bleak.write_gatt_char(UUID_FACTORY_RESET, "1".encode("utf-8"))
         await wait_or_abort(event)
-        if csv_module is not None and factory_reset_result is not None:
-            csv_module.finish_test(factory_reset_result=factory_reset_result)
+        if factory_reset_result is not None:
+            csv.finish_test(factory_reset_result=factory_reset_result)
 
         # unpair
         view.set_state("busy-unpairing")
@@ -278,15 +296,14 @@ async def _read_device_info() -> bool:
         fw_ver = data.decode("utf-8")
 
         view.update_device_info(device_name, manufacturer_name, serial_no, model_no, mac_address, fw_ver)
-        if csv_module is not None:
-            csv_module.update_basic_info(
-                device_name=device_name,
-                manufacturer_name=manufacturer_name,
-                serial_number=serial_no,
-                model_number=model_no,
-                mac_address=mac_address,
-                firmware_ver=fw_ver,
-            )
+        csv.update_basic_info(
+            device_name=device_name,
+            manufacturer_name=manufacturer_name,
+            serial_number=serial_no,
+            model_number=model_no,
+            mac_address=mac_address,
+            firmware_ver=fw_ver,
+        )
 
         text = ""
         text += f"=== {device_name} Information ===\n" \
@@ -382,8 +399,8 @@ async def add_fingerprint() -> bool:
         _mark_test_end()
         await bleak.stop_notify_silent(UUID_FINGERPRINT_ADDITION)
         log.log(f"[INFO] === Add Fingerprint end ===")
-        if csv_module is not None and result_literal is not None:
-            csv_module.update_results(fp_addition=result_literal)
+        if result_literal is not None:
+            csv.update_results(fp_addition=result_literal)
         if bleak.is_connected:
             view.set_state("idle-connected")
         else:
@@ -455,8 +472,8 @@ async def delete_fingerprint() -> bool:
         _mark_test_end()
         await bleak.stop_notify_silent(UUID_FINGERPRINT_DELETION)
         log.log(f"[INFO] === Add Fingerprint end ===")
-        if csv_module is not None and result_literal is not None:
-            csv_module.update_results(fp_deletion=result_literal)
+        if result_literal is not None:
+            csv.update_results(fp_deletion=result_literal)
         if bleak.is_connected:
             view.set_state("idle-connected")
         else:
@@ -496,8 +513,7 @@ async def start_event_management() -> bool:
                     view.var_event_session_start.set("Pass")
                     view.var_event_session_stop.set("Testing...")
                     session_start_result = "Pass"
-                    if csv_module is not None:
-                        csv_module.update_results(session_start=session_start_result)
+                    csv.update_results(session_start=session_start_result)
 
                     #await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "NOT-READY".encode("utf-8"))
                     #await asyncio.sleep(1.0)
@@ -510,8 +526,7 @@ async def start_event_management() -> bool:
                     view.set_lamp(view.lamp_event_session_stop, "pass")
                     view.var_event_session_stop.set("Pass")
                     session_stop_result = "Pass"
-                    if csv_module is not None:
-                        csv_module.update_results(session_stop=session_stop_result)
+                    csv.update_results(session_stop=session_stop_result)
 
                     await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
                     event.set()
@@ -524,11 +539,10 @@ async def start_event_management() -> bool:
                     log.log(f"[WARNING] Unknown json data: {json_data.get("action")}")
                     session_start_result = "Fail"
                     session_stop_result = "Fail"
-                    if csv_module is not None:
-                        csv_module.update_results(
-                            session_start=session_start_result,
-                            session_stop=session_stop_result,
-                        )
+                    csv.update_results(
+                        session_start=session_start_result,
+                        session_stop=session_stop_result,
+                    )
                     event.set()
             except json.JSONDecodeError:
                 view.set_lamp(view.lamp_event_session_start, "fail")
@@ -539,11 +553,10 @@ async def start_event_management() -> bool:
                 log.log(f"[ERROR] Received non-JSON data from {sender}: {data_str}")
                 session_start_result = "Fail"
                 session_stop_result = "Fail"
-                if csv_module is not None:
-                    csv_module.update_results(
-                        session_start=session_start_result,
-                        session_stop=session_stop_result,
-                    )
+                csv.update_results(
+                    session_start=session_start_result,
+                    session_stop=session_stop_result,
+                )
                 event.set()
             except Exception as exc:
                 view.set_lamp(view.lamp_event_session_start, "fail")
@@ -555,11 +568,10 @@ async def start_event_management() -> bool:
                 log.log_traceback(exc)
                 session_start_result = "Fail"
                 session_stop_result = "Fail"
-                if csv_module is not None:
-                    csv_module.update_results(
-                        session_start=session_start_result,
-                        session_stop=session_stop_result,
-                    )
+                csv.update_results(
+                    session_start=session_start_result,
+                    session_stop=session_stop_result,
+                )
                 event.set()
             # start event should still wait for stop event, so sadly the code branches event.set()
         
@@ -588,8 +600,8 @@ async def start_event_management() -> bool:
         view.set_lamp(view.lamp_camera, "not-operating") # kill camera on event finish
         await bleak.stop_notify_silent(UUID_EVENT_MANAGEMENT)
         log.log(f"[INFO] === Event Session end ===")
-        if csv_module is not None and session_start_result is not None and session_stop_result is not None:
-            csv_module.update_results(
+        if session_start_result is not None and session_stop_result is not None:
+            csv.update_results(
                 session_start=session_start_result,
                 session_stop=session_stop_result,
             )
@@ -706,12 +718,12 @@ async def ohsung_qc() -> None:
 #endregion
 
 async def main() -> None:
-    global view, log, bleak, test_abort_event, csv_module
+    global view, log, bleak, test_abort_event, csv
     view = View(VERSION)
     log = LogModule(view=view)
     test_abort_event = asyncio.Event()
     bleak = BleakModule(log=log, on_disconnect=on_disconnect, on_reconnect=on_reconnect)
-    csv_module = CsvModule(path="test_results.csv", log=log)
+    csv = CsvModule(path="test_results.csv", log=log)
 
     # === register callbacks to app ===
     view.set_handler("scan", lambda: asyncio.create_task(scan_and_update_device_list()))
