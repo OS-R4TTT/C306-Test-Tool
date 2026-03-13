@@ -8,7 +8,7 @@ from csv_module import CsvModule
 from typing import Literal
 from enum import Enum
 
-VERSION = "v1.1.2"
+VERSION = "v1.2.0"
 
 UUID_MODEL_INFO = "00002a24-0000-1000-8000-00805f9b34fb"
 UUID_SERIAL_NO = "00002a25-0000-1000-8000-00805f9b34fb"
