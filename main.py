@@ -8,7 +8,7 @@ from csv_module import CsvModule
 from typing import Literal
 from enum import Enum
 
-VERSION = "v1.1.1"
+VERSION = "v1.1.2"
 
 UUID_MODEL_INFO = "00002a24-0000-1000-8000-00805f9b34fb"
 UUID_SERIAL_NO = "00002a25-0000-1000-8000-00805f9b34fb"
@@ -167,9 +167,9 @@ async def connect_and_read_device_info() -> bool:
         csv.start_test(device_name=name, mac_address=address)
         view.clear_device_list()
         view.clear_test_result()
-        await asyncio.sleep(1.0)
-        await bleak.write_gatt_char(UUID_OHSUNG_TESTMODE_NOTIFY, bytes([0xF3]))
-        log.log(f"[INFO] Ohsung testmode command sent")
+        #await asyncio.sleep(1.0)
+        #await bleak.write_gatt_char(UUID_OHSUNG_TESTMODE_NOTIFY, bytes([0xF3]))
+        #log.log(f"[INFO] Ohsung testmode command sent")
         await read_device_info()
         return True
     except Exception as exc:
