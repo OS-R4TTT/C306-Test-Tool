@@ -68,6 +68,7 @@ class BleakModule:
                     await self.client.connect()
                     if self.client.is_connected:
                         self._log("* Reconn success")
+                        self.disconnect_expected = False
                         await self._call_hook_async(self.on_reconnect, "on_reconnect")
                         return
                 except Exception as exc:
@@ -84,6 +85,7 @@ class BleakModule:
                 self.reconnect_task = asyncio.create_task(self.reconnect())
         else:
             self._log("* Expected disconnect, does not trigger reconn")
+            self.disconnect_expected = False
 
 
     async def unpair(self) -> None:
