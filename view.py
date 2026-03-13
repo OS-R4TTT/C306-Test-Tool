@@ -250,8 +250,8 @@ class View(ttk.Window):
 
         # === ui placement - 4 ===
         #self.lbl_state.place(x=20, y=380, width=180, height=40)
-        label = ttk.Label(self, text="Log", bootstyle="inverse-info", anchor="center")
-        label.place(x=20, y=340, width=120, height=40)
+        #label = ttk.Label(self, text="Log", bootstyle="inverse-info", anchor="center")
+        #label.place(x=20, y=340, width=120, height=40)
         self.scrtxt_log.place(x=20, y=400, width=1440, height=300)
 
         # === ui placement - 5 ===
