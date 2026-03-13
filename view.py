@@ -381,9 +381,12 @@ class View(ttk.Window):
             case 'fail' | 'disconnected':
                 lamp.configure(bootstyle="inverse-danger")
             
-            case 'testing' | 'connecting' | 'not-operating':
+            case 'testing' | 'connecting':
                 lamp.configure(bootstyle='inverse-warning')
             
+            case 'not-operating':
+                lamp.configure(bootstyle="secondary-inverse")
+
             case 'none':
                 lamp.configure(bootstyle="secondary-inverse")
 
