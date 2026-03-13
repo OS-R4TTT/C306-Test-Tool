@@ -580,6 +580,7 @@ async def handle_event_management() -> bool:
         _mark_test_start()
         view.set_state("busy-event-managing")
         view.set_lamp(view.lamp_event_session_start, "testing")
+        view.set_lamp(view.lamp_event_session_stop, "none")
         view.var_event_session_start.set("Testing...")
         view.var_event_session_stop.set("")
         log.log(f"[INFO] === Event Session start ===")
