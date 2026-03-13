@@ -28,27 +28,53 @@ UUID_OHSUNG_TESTMODE = "0000ffa2-0000-1000-8000-00805f9b34fb"
 MAX_CONNECT_RETRY = 3
 FRAMERATE = 1 / 60
 
+
+TestResult = Literal['Pass', 'Fail', 'NT']
+
+# ===============================================
+#  Modules
+# ===============================================
+
 view: View = None
 log: LogModule = None
 bleak: BleakModule = None
 csv: CsvModule | None = None
 
-fingerprint_storage: dict[str, str] = {}
+# ===============================================
+#  Globals
+# ===============================================
 
 connect_lock: bool = False # ensures connect does not happen twice
 disconnect_expected = False
-test_abort_event: asyncio.Event | None = None
-tests_in_progress = 0
 
+fingerprint_storage: dict[str, str] = {}
 
-class TestAbortedError(RuntimeError):
-    """Error wrapper (Custom)"""
-    pass
+event_fp_add: asyncio.Event | None = asyncio.Event()
+event_fp_del: asyncio.Event | None = asyncio.Event()
+event_ev: asyncio.Event | None = asyncio.Event()
+event_fr: asyncio.Event | None = asyncio.Event()
+
+res_fp_add: TestResult = "NT"
+res_fp_del: TestResult = "NT"
+res_ev_start: TestResult = "NT"
+res_ev_stop: TestResult = "NT"
+res_fr: TestResult = "NT"
+
+fp_del_target_uuid = "" # caches uuid that should be erased
+
 
 # ===============================================
 #  Test wait, abort Logic (disconnect/reconnect)
 #  - `_mark_test_start`, `_mark_test_end` are only used for tests that use notification.
 # ===============================================
+
+class TestAbortedError(RuntimeError):
+    """Error wrapper (Custom)"""
+    pass
+
+test_abort_event: asyncio.Event | None = None
+tests_in_progress = 0
+
 
 def _mark_test_start() -> None:
     """
@@ -81,13 +107,16 @@ def on_disconnect() -> None:
             test_abort_event.set()
 
 
-def on_reconnect() -> None:
+async def on_reconnect() -> None:
     """
     This function will run in BleakModule after it reconnects.
-    Handles view or main attributes that BleakModule cannot access.
     """
-    view.set_state("idle-connected")
-    view.clear_test_result()
+    # We don't need to start notifications on reconnect
+
+    if len(fingerprint_storage) == 0:
+        view.set_state("idle-connected")
+    else:
+        await handle_event_management()
 
 
 async def wait_or_abort(event: asyncio.Event) -> None:
@@ -145,9 +174,9 @@ async def scan_and_update_device_list() -> bool:
 async def connect_and_read_device_info() -> bool:
     global connect_lock
     if connect_lock:
-        return
+        return False
     if view.selected_device is None: # ignore double clicks on blank space
-        return
+        return False
     connect_lock = True
 
     try:
@@ -170,6 +199,7 @@ async def connect_and_read_device_info() -> bool:
         #await asyncio.sleep(1.0)
         #await bleak.write_gatt_char(UUID_OHSUNG_TESTMODE_NOTIFY, bytes([0xF3]))
         #log.log(f"[INFO] Ohsung testmode command sent")
+        await start_notifications()
         await read_device_info()
         return True
     except Exception as exc:
@@ -179,6 +209,35 @@ async def connect_and_read_device_info() -> bool:
         return False
     finally:
         connect_lock = False
+        if bleak.is_connected:
+            view.set_state("idle-connected")
+        else:
+            view.set_state("idle-disconnected")
+
+
+async def start_notifications() -> bool:
+    if not bleak.is_connected:
+        log.log(f"[ERROR] Invalid Client")
+        return False
+    
+    try:
+        log.log(
+            f"[INFO] Enabling notifications for UUID:\n" \
+            + f"UUID_FINGERPRINT_ADDITION ({UUID_FINGERPRINT_ADDITION})\n" \
+            + f"UUID_FINGERPRINT_DELETION ({UUID_FINGERPRINT_DELETION})\n" \
+            + f"UUID_EVENT_MANAGEMENT     ({UUID_EVENT_MANAGEMENT})\n" \
+            + f"UUID_FACTORY_RESET        ({UUID_FACTORY_RESET})\n"
+        )
+        await bleak.start_notify(UUID_FINGERPRINT_ADDITION, _cb_add_fingerprint)
+        await bleak.start_notify(UUID_FINGERPRINT_DELETION, _cb_delete_fingerprint)
+        await bleak.start_notify(UUID_EVENT_MANAGEMENT, _cb_event_management)
+        await bleak.start_notify(UUID_FACTORY_RESET, _cb_factory_reset)
+        log.log("[INFO] Enable notifications complete")
+        return True
+    except Exception as exc:
+        log.log(f"[ERROR] Enable notifications failed: {exc}")
+        log.log_traceback(exc)
+    finally:
         if bleak.is_connected:
             view.set_state("idle-connected")
         else:
@@ -270,82 +329,40 @@ async def unpair_all_dekoda_remotes() -> bool:
         view.clear_test_result()
 
 
-async def factory_reset_and_unpair() -> bool:
+def _cb_add_fingerprint(_sender, data):
     """
-    Factory resets the connected device, and unpair (removes from pair list).
-    
-    Note that this will also clear `fingerprint_storage`.
+    This reads `user_name` directly from view, rather than caching it somewhere.
+
+    A malicious user can change `user_name` while fp add process; but we can ignore that.
     """
-    if not bleak.is_connected:
-        log.log(f"[ERROR] Invalid Client")
-        return False
-    
-    factory_reset_result: str | None = None
+    global res_fp_add
     try:
-        _mark_test_start()
-        bleak.disconnect_expected = True
-        view.set_state("busy-factory-resetting")
-        log.log(f"[INFO] Factory resetting...")
-
-        event = asyncio.Event()
-
-        def _cb(_sender, data):
-            nonlocal factory_reset_result
-            try:
-                data_str = data.decode("utf-8")
-                if data_str == "OK":
-                    view.var_factory_reset.set("Pass")
-                    view.set_lamp(view.lamp_factory_reset, "pass")
-                    log.log(f"[INFO] Factory reset response OK")
-                    factory_reset_result = "Pass"
-                else:
-                    view.var_factory_reset.set("Fail")
-                    view.set_lamp(view.lamp_factory_reset, "fail")
-                    log.log(f"[ERROR] Factory reset response NG: {data_str}")
-                    factory_reset_result = "Fail"
-            except UnicodeDecodeError:
-                view.var_factory_reset.set("Fail")
-                view.set_lamp(view.lamp_factory_reset, "fail")
-                log.log(f"[ERROR] Received non-UTF-8 data: {data}")
-                factory_reset_result = "Fail"
-            except Exception as exc:
-                view.var_factory_reset.set("Fail")
-                view.set_lamp(view.lamp_factory_reset, "fail")
-                log.log(f"[ERROR] Processing notification failed: {exc}")
-                log.log_traceback(exc)
-                factory_reset_result = "Fail"
-            finally:
-                event.set()
-        
-        # factory reset
-        await bleak.start_notify(UUID_FACTORY_RESET, callback=_cb)
-        await bleak.write_gatt_char(UUID_FACTORY_RESET, "1".encode("utf-8"))
-        await wait_or_abort(event)
-        if factory_reset_result is not None:
-            csv.finish_test(factory_reset_result=factory_reset_result)
-
-        # unpair
-        view.set_state("busy-unpairing")
-        log.log(f"[INFO] Unpairing...")
-        await bleak.unpair()
-        view.set_state("idle-disconnected")
-        log.log(f"[INFO] Factory reset + Unpair complete")
-        return True
+        user_name = view.user_name
+        data_str = data.decode("utf-8")
+        if data_str == "CANCEL":
+            res_fp_add = "Fail"
+            view.var_fp_addition.set("Add Fingerprint canceled by user")
+            view.set_lamp(view.lamp_fp_addition, 'fail')
+            log.log(f"[INFO] Add Fingerprint canceled by user")
+        else:
+            fingerprint_storage[data_str] = user_name
+            res_fp_add = "Pass"
+            view.update_fingerprint_list(fingerprint_storage)
+            view.set_lamp(view.lamp_fp_addition, 'pass')
+            log.log(f"[INFO] Registered fingerprint with {data_str} ({user_name})")
+    except UnicodeDecodeError:
+        res_fp_add = "Fail"
+        view.var_fp_addition.set("Received non UTF-8 data")
+        view.set_lamp(view.lamp_fp_addition, 'fail')
+        log.log(f"[ERROR] Received non-UTF-8 data: {data}")
     except Exception as exc:
-        log.log(f"[ERROR] Factory reset + Unpair failed: {exc}")
+        res_fp_add = "Fail"
+        view.var_fp_addition.set("Error in notification")
+        view.set_lamp(view.lamp_fp_addition, 'fail')
+        log.log(f"[ERROR] Processing notification failed: {exc}")
         log.log_traceback(exc)
-        return False
     finally:
-        _mark_test_end()
-        fingerprint_storage.clear()
-        await bleak.stop_notify_silent(UUID_FACTORY_RESET)
-        bleak.client = None
-        view.set_state("idle-disconnected")
-        log.log(f"[INFO] Test result will be erased in 5 seconds")
-        await asyncio.sleep(5.0)
-        view.clear_device_list()
-        view.clear_device_info()
-        view.clear_test_result()
+        event_fp_add.set()
 
 
 async def add_fingerprint() -> bool:
@@ -359,74 +376,69 @@ async def add_fingerprint() -> bool:
     # sanitize user_name
     user_name = view.user_name
     if not (bool(user_name) and user_name.isalpha() and len(user_name) <= 8):
-        log.log(f"[WARN] User Name: {user_name} is invalid (1-8 len, only alphabets allowed)\n" \
-                + f"Please enter a valid user name and try again."
+        log.log(
+            f"[WARN] User Name: {user_name} is invalid (1-8 len, only alphabets allowed)\n" \
+            + f"Please enter a valid user name and try again."
         )
         return False
 
-    result_literal: str | None = None
     try:
+        global event_fp_add, res_fp_add
         _mark_test_start()
         view.set_state("busy-adding-fingerprint")
         view.set_lamp(view.lamp_fp_addition, 'testing')
         view.var_fp_addition.set("Testing...")
         log.log(f"[INFO] === Add Fingerprint start ===")
 
-        event = asyncio.Event()
-        cb_passed = False
+        event_fp_add = asyncio.Event()
+        res_fp_add = "NT"
 
-        def _cb(_sender, data):
-            nonlocal cb_passed
-            try:
-                data_str = data.decode("utf-8")
-                if data_str == "CANCEL":
-                    view.var_fp_addition.set("Add Fingerprint canceled by user")
-                    view.set_lamp(view.lamp_fp_addition, 'fail')
-                    log.log(f"[INFO] Add Fingerprint canceled by user")
-                else:
-                    fingerprint_storage[data_str] = user_name
-                    cb_passed = True
-                    view.update_fingerprint_list(fingerprint_storage)
-                    view.set_lamp(view.lamp_fp_addition, 'pass')
-                    log.log(f"[INFO] Registered fingerprint with {data_str} ({user_name})")
-            except UnicodeDecodeError:
-                view.var_fp_addition.set("Received non UTF-8 data")
-                view.set_lamp(view.lamp_fp_addition, 'fail')
-                log.log(f"[ERROR] Received non-UTF-8 data: {data}")
-            except Exception as exc:
-                view.var_fp_addition.set("Error in notification")
-                view.set_lamp(view.lamp_fp_addition, 'fail')
-                log.log(f"[ERROR] Processing notification failed: {exc}")
-                log.log_traceback(exc)
-            finally:
-                event.set()
-
-        await bleak.start_notify(UUID_FINGERPRINT_ADDITION, callback=_cb)
         await bleak.write_gatt_char(UUID_FINGERPRINT_ADDITION, user_name.encode("utf-8"))
-        await wait_or_abort(event) # wait until user presses fp addition
-        result_literal = "Pass" if cb_passed else "Fail"
-        return cb_passed
+        await wait_or_abort(event_fp_add) # wait until user presses fp addition
+        return res_fp_add == "Pass"
     except TestAbortedError:
+        res_fp_add = "Fail"
         view.var_fp_addition.set("Aborted")
         view.set_lamp(view.lamp_fp_addition, 'fail')
-        result_literal = "Fail"
         return False
     except Exception as exc:
+        res_fp_add = "Fail"
         view.var_fp_addition.set("FP add failed")
         view.set_lamp(view.lamp_fp_addition, 'fail')
         log.log(f"[ERROR] Fingerprint addition failed: {exc}")
-        result_literal = "Fail"
         return False
     finally:
         _mark_test_end()
-        await bleak.stop_notify_silent(UUID_FINGERPRINT_ADDITION)
         log.log(f"[INFO] === Add Fingerprint end ===")
-        if result_literal is not None:
-            csv.update_results(fp_addition=result_literal)
+        csv.update_results(fp_addition=res_fp_add)
         if bleak.is_connected:
             view.set_state("idle-connected")
         else:
             view.set_state("idle-disconnected")
+
+
+def _cb_delete_fingerprint(_sender, data):
+    global res_fp_del
+    try:
+        data_str = data.decode("utf-8")
+        if data_str == "OK":
+            del fingerprint_storage[fp_del_target_uuid]
+            # To check all passes for each uuid, set to "Pass" when not "Fail"
+            if res_fp_del != "Fail":
+                res_fp_del = "Pass"
+            log.log(f"[INFO] Remove successful ({data_str})")
+        else:
+            res_fp_del = "Fail"
+            log.log(f"[WARN] Remove failed ({data_str})")
+    except UnicodeDecodeError:
+        res_fp_del = "Fail"
+        log.log(f"[ERROR] Received non-UTF-8 data: {data}")
+    except Exception as exc:
+        res_fp_del = "Fail"
+        log.log(f"[ERROR] Processing notification failed: {exc}")
+        log.log_traceback(exc)
+    finally:
+        event_fp_del.set()
 
 
 async def delete_fingerprint() -> bool:
@@ -444,84 +456,127 @@ async def delete_fingerprint() -> bool:
         log.log(f"[WARN] No fingerprint added. Ignoring request")
         return False
     
-    result_literal: str | None = None
     try:
+        global event_fp_del, res_fp_del, fp_del_target_uuid
         _mark_test_start()
         view.set_state("busy-deleting-fingerprint")
         view.set_lamp(view.lamp_fp_deletion, 'testing')
         view.var_fp_deletion.set("Testing...")
         log.log(f"[INFO] === Delete Fingerprint start ===")
 
-        event = asyncio.Event()
-        target_uuid = ""
-        all_pass = True
-
-        def _cb(_sender, data):
-            global all_pass
-            try:
-                data_str = data.decode("utf-8")
-                if data_str == "OK":
-                    del fingerprint_storage[target_uuid]
-                    log.log(f"[INFO] Remove successful ({data_str})")
-                else:
-                    all_pass = False
-                    log.log(f"[WARN] Remove failed ({data_str})")
-            except UnicodeDecodeError:
-                all_pass = False
-                log.log(f"[ERROR] Received non-UTF-8 data: {data}")
-            except Exception as exc:
-                all_pass = False
-                log.log(f"[ERROR] Processing notification failed: {exc}")
-                log.log_traceback(exc)
-            finally:
-                event.set()
+        event_fp_del = asyncio.Event()
+        res_fp_del = "NT"
         
-        await bleak.start_notify(UUID_FINGERPRINT_DELETION, callback=_cb)
         # Erase all fingerprints
         for uuid in list(fingerprint_storage.keys()):
-            target_uuid = uuid
-            await bleak.write_gatt_char(UUID_FINGERPRINT_DELETION, target_uuid.encode("utf-8"))
-        await wait_or_abort(event)
-        view.var_fp_deletion.set("Pass" if all_pass else "Fail")
-        view.set_lamp(view.lamp_fp_deletion, 'pass' if all_pass else 'fail')
-        result_literal = "Pass" if all_pass else "Fail"
-        return all_pass
+            fp_del_target_uuid = uuid
+            await bleak.write_gatt_char(UUID_FINGERPRINT_DELETION, fp_del_target_uuid.encode("utf-8"))
+        await wait_or_abort(event_fp_del)
+        view.var_fp_deletion.set(res_fp_del)
+        view.set_lamp(view.lamp_fp_deletion, 'pass' if res_fp_del == "Pass" else 'fail')
+        return res_fp_del == "Pass"
     except TestAbortedError:
+        res_fp_del = "Fail"
         view.var_fp_deletion.set("Aborted")
         view.set_lamp(view.lamp_fp_deletion, 'fail')
-        result_literal = "Fail"
         return False
     except Exception as exc:
+        res_fp_del = "Fail"
         view.var_fp_deletion.set("Fail")
         view.set_lamp(view.lamp_fp_deletion, 'fail')
         log.log(f"[ERROR] Fingerprint deletion failed: {exc}")
-        result_literal = "Fail"
         return False
     finally:
         _mark_test_end()
-        await bleak.stop_notify_silent(UUID_FINGERPRINT_DELETION)
         log.log(f"[INFO] === Delete Fingerprint end ===")
-        if result_literal is not None:
-            csv.update_results(fp_deletion=result_literal)
+        csv.update_results(fp_deletion=res_fp_del)
         if bleak.is_connected:
             view.set_state("idle-connected")
         else:
             view.set_state("idle-disconnected")
 
 
-async def start_event_management() -> bool:
+async def _cb_event_management(sender, data):
     """
-    Handles event sessions from start fo finish.
-    The callback `_cb` will be called twice (start, finish).
+    This callback should be called twice
     """
+    global res_ev_start, res_ev_stop
+    try:
+        data_str = data.decode("utf-8")
+        json_data = json.loads(data_str)
+        log.log(f"[INFO] Notification from {sender}: {json.dumps(json_data, indent=2)}")
 
+        action = json_data.get("action")
+        
+        if action == "start":
+            res_ev_start = "Pass"
+            view.set_lamp(view.lamp_camera, "operating")
+            view.set_lamp(view.lamp_event_session_start, "pass")
+            view.set_lamp(view.lamp_event_session_stop, "testing")
+            view.var_event_session_start.set("Pass")
+            view.var_event_session_stop.set("Testing...")
+            csv.update_results(session_start=res_ev_start)
+            await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "IN-PROGRESS".encode("utf-8"))
+            await asyncio.sleep(3.0)
+            await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
+            # we should still wait for stop event, so it does not set event
+        elif action == "stop":
+            res_ev_stop = "Pass"
+            view.set_lamp(view.lamp_camera, "not-operating")
+            view.set_lamp(view.lamp_event_session_stop, "pass")
+            view.var_event_session_stop.set("Pass")
+            csv.update_results(session_stop=res_ev_stop)
+            await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
+            event_ev.set()
+        elif action == "cancel":
+            res_ev_start = "Fail"
+            res_ev_stop = "Fail"
+            view.set_lamp(view.lamp_camera, "not-operating")
+            view.set_lamp(view.lamp_event_session_start, "fail")
+            view.set_lamp(view.lamp_event_session_stop, "fail")
+            view.var_event_session_start.set("Canceled by user")
+            view.var_event_session_stop.set("Canceled by user")
+            event_ev.set()
+        else:
+            res_ev_start = "Fail"
+            res_ev_stop = "Fail"
+            view.set_lamp(view.lamp_event_session_start, "fail")
+            view.set_lamp(view.lamp_event_session_stop, "fail")
+            view.var_event_session_start.set("Fail")
+            view.var_event_session_stop.set("Fail")
+            log.log(f"[WARNING] Unknown json data: {json_data.get("action")}")
+            csv.update_results(session_start=res_ev_start, session_stop=res_ev_stop)
+            event_ev.set()
+    except json.JSONDecodeError:
+        res_ev_start = "Fail"
+        res_ev_stop = "Fail"
+        view.set_lamp(view.lamp_event_session_start, "fail")
+        view.set_lamp(view.lamp_event_session_stop, "fail")
+        view.var_event_session_start.set("Fail")
+        view.var_event_session_stop.set("Fail")
+        log.log(f"[ERROR] Received non-JSON data from {sender}: {data_str}")
+        csv.update_results(session_start=res_ev_start, session_stop=res_ev_stop)
+        event_ev.set()
+    except Exception as exc:
+        res_ev_start = "Fail"
+        res_ev_stop = "Fail"
+        view.set_lamp(view.lamp_event_session_start, "fail")
+        view.set_lamp(view.lamp_event_session_stop, "fail")
+        view.var_event_session_start.set("Fail")
+        view.var_event_session_stop.set("Fail")
+        log.log(f"[ERROR] Processing notification failed: {exc}")
+        log.log_traceback(exc)
+        csv.update_results(session_start=res_ev_start, session_stop=res_ev_stop)
+        event_ev.set()
+
+
+async def handle_event_management() -> bool:
     if not bleak.is_connected:
         log.log(f"[ERROR] Invalid client")
         return False
 
-    session_start_result: str | None = None
-    session_stop_result: str | None = None
     try:
+        global event_ev, res_ev_start, res_ev_stop
         _mark_test_start()
         view.set_state("busy-event-managing")
         view.set_lamp(view.lamp_event_session_start, "testing")
@@ -529,116 +584,35 @@ async def start_event_management() -> bool:
         view.var_event_session_stop.set("")
         log.log(f"[INFO] === Event Session start ===")
 
-        event = asyncio.Event()
-        session_start_result = "NT"
-        session_stop_result = "NT"
+        event_ev = asyncio.Event()
+        res_ev_start = "NT"
+        res_ev_stop = "NT"
 
-        async def _cb(sender, data):
-            nonlocal session_start_result, session_stop_result
-            try:
-                data_str = data.decode("utf-8")
-                json_data = json.loads(data_str)
-                log.log(f"[INFO] Notification from {sender}: {json.dumps(json_data, indent=2)}")
-                
-                if json_data.get("action") == "start":
-                    view.set_lamp(view.lamp_camera, "operating")
-                    view.set_lamp(view.lamp_event_session_start, "pass")
-                    view.set_lamp(view.lamp_event_session_stop, "testing")
-                    view.var_event_session_start.set("Pass")
-                    view.var_event_session_stop.set("Testing...")
-                    session_start_result = "Pass"
-                    csv.update_results(session_start=session_start_result)
-
-                    #await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "NOT-READY".encode("utf-8"))
-                    #await asyncio.sleep(1.0)
-                    await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "IN-PROGRESS".encode("utf-8"))
-                    await asyncio.sleep(3.0)
-                    await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
-                    
-                elif json_data.get("action") == "stop":
-                    view.set_lamp(view.lamp_camera, "not-operating")
-                    view.set_lamp(view.lamp_event_session_stop, "pass")
-                    view.var_event_session_stop.set("Pass")
-                    session_stop_result = "Pass"
-                    csv.update_results(session_stop=session_stop_result)
-
-                    await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
-                    event.set()
-                else:
-                    view.set_lamp(view.lamp_event_session_start, "fail")
-                    view.set_lamp(view.lamp_event_session_stop, "fail")
-                    view.var_event_session_start.set("Fail")
-                    view.var_event_session_stop.set("Fail")
-
-                    log.log(f"[WARNING] Unknown json data: {json_data.get("action")}")
-                    session_start_result = "Fail"
-                    session_stop_result = "Fail"
-                    csv.update_results(
-                        session_start=session_start_result,
-                        session_stop=session_stop_result,
-                    )
-                    event.set()
-            except json.JSONDecodeError:
-                view.set_lamp(view.lamp_event_session_start, "fail")
-                view.set_lamp(view.lamp_event_session_stop, "fail")
-                view.var_event_session_start.set("Fail")
-                view.var_event_session_stop.set("Fail")
-
-                log.log(f"[ERROR] Received non-JSON data from {sender}: {data_str}")
-                session_start_result = "Fail"
-                session_stop_result = "Fail"
-                csv.update_results(
-                    session_start=session_start_result,
-                    session_stop=session_stop_result,
-                )
-                event.set()
-            except Exception as exc:
-                view.set_lamp(view.lamp_event_session_start, "fail")
-                view.set_lamp(view.lamp_event_session_stop, "fail")
-                view.var_event_session_start.set("Fail")
-                view.var_event_session_stop.set("Fail")
-
-                log.log(f"[ERROR] Processing notification failed: {exc}")
-                log.log_traceback(exc)
-                session_start_result = "Fail"
-                session_stop_result = "Fail"
-                csv.update_results(
-                    session_start=session_start_result,
-                    session_stop=session_stop_result,
-                )
-                event.set()
-            # start event should still wait for stop event, so sadly the code branches event.set()
-        
-        await bleak.start_notify(UUID_EVENT_MANAGEMENT, callback=_cb)
-        await wait_or_abort(event)
-        return True
+        # The remote triggers the event, so there is no write_gatt_char here
+        await wait_or_abort(event_ev)
+        return res_ev_start == "Pass" and res_ev_stop == "Pass"
     except TestAbortedError:
+        res_ev_start = "Fail"
+        res_ev_stop = "Fail"
         view.set_lamp(view.lamp_event_session_start, "fail")
         view.set_lamp(view.lamp_event_session_stop, "fail")
         view.var_event_session_start.set("Aborted")
         view.var_event_session_stop.set("Aborted")
-        session_start_result = "Fail"
-        session_stop_result = "Fail"
         return False
     except Exception as exc:
+        res_ev_start = "Fail"
+        res_ev_stop = "Fail"
         view.set_lamp(view.lamp_event_session_start, "fail")
         view.set_lamp(view.lamp_event_session_stop, "fail")
         view.var_event_session_start.set("Fail")
         view.var_event_session_stop.set("Fail")
         log.log(f"[ERROR] Event management failed: {exc}")
-        session_start_result = "Fail"
-        session_stop_result = "Fail"
         return False
     finally:
         _mark_test_end()
         view.set_lamp(view.lamp_camera, "not-operating") # kill camera on event finish
-        await bleak.stop_notify_silent(UUID_EVENT_MANAGEMENT)
         log.log(f"[INFO] === Event Session end ===")
-        if session_start_result is not None and session_stop_result is not None:
-            csv.update_results(
-                session_start=session_start_result,
-                session_stop=session_stop_result,
-            )
+        csv.update_results(session_start=res_ev_start, session_stop=res_ev_stop)
         if bleak.is_connected:
             view.set_state("idle-connected")
         else:
@@ -659,98 +633,138 @@ async def fp_add_and_event_session() -> bool:
         if not ok:
             return False
 
-        ok = await start_event_management()
+        ok = await handle_event_management()
         return ok
     except: # logs are already handled in both functions, thus exception will never happen
         return False
-    finally: # this part is also not necessary, but for aesthetics
-        if bleak.is_connected:
-            view.set_state("idle-connected")
+
+
+def _cb_factory_reset(_sender, data):
+    global res_fr
+    try:
+        data_str = data.decode("utf-8")
+        if data_str == "OK":
+            res_fr = "Pass"
+            view.var_factory_reset.set("Pass")
+            view.set_lamp(view.lamp_factory_reset, "pass")
+            log.log(f"[INFO] Factory reset response OK")
         else:
-            view.set_state("idle-disconnected")
+            res_fr = "Fail"
+            view.var_factory_reset.set("Fail")
+            view.set_lamp(view.lamp_factory_reset, "fail")
+            log.log(f"[ERROR] Factory reset response NG: {data_str}")
+    except UnicodeDecodeError:
+        res_fr = "Fail"
+        view.var_factory_reset.set("Fail")
+        view.set_lamp(view.lamp_factory_reset, "fail")
+        log.log(f"[ERROR] Received non-UTF-8 data: {data}")
+    except Exception as exc:
+        res_fr = "Fail"
+        view.var_factory_reset.set("Fail")
+        view.set_lamp(view.lamp_factory_reset, "fail")
+        log.log(f"[ERROR] Processing notification failed: {exc}")
+        log.log_traceback(exc)
+    finally:
+        event_fr.set()
 
-#region unused
-async def start_remote_diagnostic() -> None:
-    """
-    Unlike other functions, this only stops remote diagnostic when any json callback is detected.
-    This makes the `view.set_state` branching inside the `except` rather than `finally` statement.
-    """
 
+async def factory_reset() -> bool:
+    """
+    Factory resets the connected device
+    Note that this will also clear `fingerprint_storage`.
+    """
     if not bleak.is_connected:
         log.log(f"[ERROR] Invalid Client")
-        return
+        return False
     
     try:
-        view.set_state("busy-remote-diagnosting")
+        global event_fr, res_fr
+        _mark_test_start()
+        view.set_state("busy-factory-resetting")
+        log.log(f"[INFO] === Factory Reset start ===")
 
-        def _cb(sender, data):
-            try:
-                data_str = data.decode("utf-8")
-                json_data = json.loads(data_str)
-                log.log(f"[INFO] Notification from {sender}: {json.dumps(json_data, indent=2)}")
-            except json.JSONDecodeError:
-                log.log(f"[ERROR] Received non-JSON data from {sender}: {data_str}")
-            except Exception as exc:
-                print(f"[Error] Processing notification failed: {exc}")
-                log.log_traceback(exc)
-            finally:
-                asyncio.create_task(stop_remote_diagnostic())
-    
-        await bleak.start_notify(UUID_REMOTE_DIAGNOSTIC, callback=_cb)
-        await bleak.write_gatt_char(UUID_REMOTE_DIAGNOSTIC, "1".encode("utf-8"))
+        event_fr = asyncio.Event()
+
+        # factory reset
+        bleak.disconnect_expected = True
+        await bleak.write_gatt_char(UUID_FACTORY_RESET, "1".encode("utf-8"))
+        await wait_or_abort(event_fr)
+        fingerprint_storage.clear()
+        return True
     except Exception as exc:
-        log.log(f"[ERROR] Remote diagnostic failed: {exc}")
+        res_fr = "Fail"
+        view.var_factory_reset.set("Factory Reset failed")
+        view.set_lamp(view.lamp_factory_reset, 'fail')
+        log.log(f"[ERROR] Factory reset + Unpair failed: {exc}")
+        log.log_traceback(exc)
+        return False
+    finally:
+        _mark_test_end()
+        log.log(f"[INFO] === Factory Reset end ===")
+        csv.finish_test(factory_reset_result=res_fr)
         if bleak.is_connected:
             view.set_state("idle-connected")
         else:
             view.set_state("idle-disconnected")
 
 
-async def stop_remote_diagnostic() -> None:
-    """
-    Remote diagnostic can be stopped manually by calling this function
-    """
-    await bleak.stop_notify_silent(UUID_REMOTE_DIAGNOSTIC)
-    if bleak.is_connected:
-        view.set_state("idle-connected")
-    else:
+async def unpair_and_clear_test_result() -> bool:
+    # we will not check bleak connection, if fails, silently exits
+
+    try:
+        view.set_state("busy-unpairing")
+        log.log(f"[INFO] === Unpair start ===")
+        # https://bleak.readthedocs.io/en/latest/api/client.html#bleak.BleakClient.stop_notify
+        # Notifications are stopped automatically on disconnect, so this method does not need
+        # to be called unless notifications need to be stopped some time before the device disconnects.
+        """
+        log.log(
+            f"[INFO] Disabling notifications for UUID:\n" \
+            + f"UUID_FINGERPRINT_ADDITION ({UUID_FINGERPRINT_ADDITION})\n" \
+            + f"UUID_FINGERPRINT_DELETION ({UUID_FINGERPRINT_DELETION})\n" \
+            + f"UUID_EVENT_MANAGEMENT     ({UUID_EVENT_MANAGEMENT})\n" \
+            + f"UUID_FACTORY_RESET        ({UUID_FACTORY_RESET})\n"
+        )
+        await bleak.stop_notify_silent(UUID_FINGERPRINT_ADDITION)
+        await bleak.stop_notify_silent(UUID_FINGERPRINT_DELETION)
+        await bleak.stop_notify_silent(UUID_EVENT_MANAGEMENT)
+        await bleak.stop_notify_silent(UUID_FACTORY_RESET)
+        log.log("[INFO] Disable notifications complete")
+        """
+        await bleak.unpair()
+        return True
+    except Exception as exc:
+        log.log(f"[ERROR] Unpair failed: {exc}")
+        log.log_traceback(exc)
+        return False
+    finally:
+        log.log(f"[INFO] === Unpair end ===")
         view.set_state("idle-disconnected")
 
+        bleak.client = None
 
-async def ohsung_qc() -> None:
+        log.log(f"[INFO] Test result will be erased in 5 seconds")
+        await asyncio.sleep(5.0)
+        view.clear_device_list()
+        view.clear_device_info()
+        view.clear_test_result()
+
+
+async def factory_reset_and_unpair() -> bool:
     if not bleak.is_connected:
         log.log(f"[ERROR] Invalid Client")
-        return
+        return False
     
     try:
-        log.log(f"=== OHSUNG 출하 검사 시작 ===")
+        ok = await factory_reset()
+        if not ok:
+            return False
+        
+        ok = await unpair_and_clear_test_result()
+        return ok
+    except: # logs are already handled in both functions, thus exception will never happen
+        return False
 
-        # 1. Basic info
-        data = await bleak.read_gatt_char(UUID_SW_VER)
-        sw_ver = data.decode("utf-8")
-        data = await bleak.read_gatt_char(UUID_SERIAL_NO)
-        serial_no = data.decode("utf-8")
-        log.log(f"1. Basic Info")
-        log.log(f" - FW version: {sw_ver}")
-        log.log(f" - Serial no : {serial_no}")
-
-        # 2. Fingerprint addition
-        log.log(f"2. Add fingerprint")
-        await add_fingerprint()
-
-        # 3. Event management
-        log.log(f"3. Event management")
-        await start_event_management()
-
-        log.log(f"=== OHSUNG 출하 검사 종료 ===")
-    except Exception as exc:
-        log.log(f"[ERROR] Fingerprint deletion failed: {exc}")
-    finally:
-        if bleak.is_connected:
-            view.set_state("idle-connected")
-        else:
-            view.set_state("idle-disconnected")
-#endregion
 
 async def main() -> None:
     global view, log, bleak, test_abort_event, csv
