@@ -398,7 +398,7 @@ async def add_fingerprint() -> bool:
         return res_fp_add == "Pass"
     except TestAbortedError:
         res_fp_add = "Fail"
-        view.var_fp_addition.set("Aborted")
+        view.var_fp_addition.set("Disconnected")
         view.set_lamp(view.lamp_fp_addition, 'fail')
         return False
     except Exception as exc:
@@ -477,7 +477,7 @@ async def delete_fingerprint() -> bool:
         return res_fp_del == "Pass"
     except TestAbortedError:
         res_fp_del = "Fail"
-        view.var_fp_deletion.set("Aborted")
+        view.var_fp_deletion.set("Disconnected")
         view.set_lamp(view.lamp_fp_deletion, 'fail')
         return False
     except Exception as exc:
@@ -596,8 +596,8 @@ async def handle_event_management() -> bool:
         res_ev_stop = "Fail"
         view.set_lamp(view.lamp_event_session_start, "fail")
         view.set_lamp(view.lamp_event_session_stop, "fail")
-        view.var_event_session_start.set("Aborted")
-        view.var_event_session_stop.set("Aborted")
+        view.var_event_session_start.set("Disconnected")
+        view.var_event_session_stop.set("Disconnected")
         return False
     except Exception as exc:
         res_ev_start = "Fail"
