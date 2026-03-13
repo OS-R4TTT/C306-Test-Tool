@@ -1,10 +1,15 @@
 import tkinter as tk
 import tkinter.font as tkfont
+import time
 import ttkbootstrap as ttk
 from tkinter.scrolledtext import ScrolledText
 from ttkbootstrap.widgets.tableview import Tableview
 from collections.abc import Callable
 from typing import Literal
+
+
+LONG_PRESS_TRIGGER_MS = 600
+LONG_PRESS_TICK_MS = 20
 
 
 State = Literal[
@@ -19,6 +24,7 @@ State = Literal[
     'busy-remote-diagnosting',
     'busy-event-managing',
     'busy-factory-resetting',
+    'debug',
 ]
 
 
@@ -38,6 +44,11 @@ class View(ttk.Window):
 
         self._handlers: dict[str, Callable[[], None]] = {}
 
+        # For long-press button (factory reset) handling
+        self._factory_reset_after_id: str | None = None
+        self._factory_reset_press_start: float | None = None
+        self._factory_reset_ignore = False
+
         # === variables ===
         self.var_state = ttk.StringVar(value="idle-disconnected")
 
@@ -55,6 +66,10 @@ class View(ttk.Window):
         self.var_event_session_stop = ttk.StringVar(value="")
         self.var_fp_deletion = ttk.StringVar(value="")
         self.var_factory_reset = ttk.StringVar(value="")
+
+        # ========================
+        # UI Components
+        # ========================
         
         # === ui components - 1 ===
         self.btn_scan = ttk.Button(
@@ -115,12 +130,26 @@ class View(ttk.Window):
             command=lambda: self._dispatch("fp_delete"),
             bootstyle="success",
         )
+        # Legacy button (not used)
+        """
         self.btn_factory_reset = ttk.Button(
             self,
             text="Factory Reset",
             command=lambda: self._dispatch("factory_reset"),
             bootstyle="success",
         )
+        """
+        self.btn_factory_reset = ttk.Floodgauge(
+            self,
+            font=self.font_small, # for some reason this widget needs to set font even if it's already set to default
+            text="Factory Reset",
+            bootstyle="success",
+            maximum=100,
+            value=0,
+        )
+
+        self.btn_factory_reset.bind("<ButtonPress-1>", self._on_factory_reset_press)
+        self.btn_factory_reset.bind("<ButtonRelease-1>", self._on_factory_reset_release)
 
         self.lbl_fp_addition = ttk.Entry(self, textvariable=self.var_fp_addition, bootstyle="secondary")
         self.lbl_event_session_start = ttk.Entry(self, textvariable=self.var_event_session_start, bootstyle="secondary")
@@ -156,6 +185,10 @@ class View(ttk.Window):
 
         self.set_lamp(self.lamp_ble, 'disconnected')
         self.set_lamp(self.lamp_camera, 'not-operating')
+
+        # ========================
+        # UI Placements
+        # ========================
 
         # === ui placement - 1 ===
         self.btn_scan.place(x=20, y=20, width=130, height=40)
@@ -217,8 +250,8 @@ class View(ttk.Window):
 
         # === ui placement - 4 ===
         #self.lbl_state.place(x=20, y=380, width=180, height=40)
-        label = ttk.Label(self, text="Log", bootstyle="inverse-info", anchor="center")
-        label.place(x=20, y=340, width=120, height=40)
+        #label = ttk.Label(self, text="Log", bootstyle="inverse-info", anchor="center")
+        #label.place(x=20, y=340, width=120, height=40)
         self.scrtxt_log.place(x=20, y=400, width=1440, height=300)
 
         # === ui placement - 5 ===
@@ -242,6 +275,13 @@ class View(ttk.Window):
         self.var_state.set(state)
 
         match state:
+            case 'debug':
+                self.btn_scan.configure(state="normal")
+                self.btn_dongle_reset.configure(state="normal")
+                self.btn_fp_add.configure(state="normal")
+                self.btn_fp_delete.configure(state="normal")
+                self.btn_factory_reset.configure(state="normal")
+
             case 'idle-disconnected':
                 # only scan is allowed
                 self.btn_scan.configure(state="normal")
@@ -341,9 +381,12 @@ class View(ttk.Window):
             case 'fail' | 'disconnected':
                 lamp.configure(bootstyle="inverse-danger")
             
-            case 'testing' | 'connecting' | 'not-operating':
+            case 'testing' | 'connecting':
                 lamp.configure(bootstyle='inverse-warning')
             
+            case 'not-operating':
+                lamp.configure(bootstyle="secondary-inverse")
+
             case 'none':
                 lamp.configure(bootstyle="secondary-inverse")
 
@@ -368,6 +411,59 @@ class View(ttk.Window):
             handler()
         else:
             print(f"!! There is no action named: {action}")
+
+
+    def _on_factory_reset_press(self, _event: tk.Event) -> None:
+        if self._factory_reset_ignore:
+            return
+        if str(self.btn_factory_reset.cget("state")) == "disabled":
+            return
+
+        self._factory_reset_press_start = time.perf_counter()
+        self.btn_factory_reset.configure(value=0)
+        if self._factory_reset_after_id is not None:
+            self.after_cancel(self._factory_reset_after_id)
+            self._factory_reset_after_id = None
+        self._factory_reset_after_id = self.after(
+            LONG_PRESS_TICK_MS,
+            self._update_factory_reset_fill,
+        )
+
+
+    def _on_factory_reset_release(self, _event: tk.Event) -> None:
+        if self._factory_reset_after_id is not None:
+            self.after_cancel(self._factory_reset_after_id)
+            self._factory_reset_after_id = None
+
+        self._factory_reset_press_start = None
+        self.btn_factory_reset.configure(value=0)
+
+        if self._factory_reset_ignore:
+            self._factory_reset_ignore = False
+
+
+    def _update_factory_reset_fill(self) -> None:
+        if self._factory_reset_press_start is None or self._factory_reset_ignore:
+            return
+
+        elapsed_ms = (time.perf_counter() - self._factory_reset_press_start) * 1000.0
+        t = min(elapsed_ms / LONG_PRESS_TRIGGER_MS, 1.0)
+        eased = 1.0 - (1.0 - t) ** 2
+        max_value = float(self.btn_factory_reset.cget("maximum"))
+        self.btn_factory_reset.configure(value=max_value * eased)
+
+        if elapsed_ms >= LONG_PRESS_TRIGGER_MS:
+            self.btn_factory_reset.configure(value=0)
+            self._factory_reset_ignore = True
+            self._factory_reset_press_start = None
+            self._factory_reset_after_id = None
+            self._dispatch("factory_reset")
+            return
+
+        self._factory_reset_after_id = self.after(
+            LONG_PRESS_TICK_MS,
+            self._update_factory_reset_fill,
+        )
     
 
     @property
@@ -418,6 +514,8 @@ if __name__ == "__main__":
         view.var_fp_deletion.set("Vivamus dictum tincidunt orci vitae lacinia")
         view.var_factory_reset.set("This is a test text")
         view.log("[DEBUG] This is a test mode (view)")
+
+        view.set_state('debug')
 
     view.after(0, debug_seed)
     view.mainloop()

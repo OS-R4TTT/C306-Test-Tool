@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from collections.abc import Callable
 from bleak import BleakClient, BleakScanner
 from bleak.backends.device import BLEDevice
@@ -67,8 +68,8 @@ class BleakModule:
                     await self.client.connect()
                     if self.client.is_connected:
                         self._log("* Reconn success")
-                        if self.on_reconnect is not None:
-                            self.on_reconnect()
+                        self.disconnect_expected = False
+                        await self._call_hook_async(self.on_reconnect, "on_reconnect")
                         return
                 except Exception as exc:
                     self._log("* Reconn failed, trying again...")
@@ -78,13 +79,13 @@ class BleakModule:
     def _disconnected_callback(self, _client):
         self._log("* Device disconnected", force_file_open=False)
         if not self.disconnect_expected:
-            if self.on_disconnect is not None:
-                self.on_disconnect()
+            self._call_hook_sync(self.on_disconnect, "on_disconnect")
             if self.reconnect_task is None or self.reconnect_task.done():
                 self._log("Unexpected disconn, try reconnection")
                 self.reconnect_task = asyncio.create_task(self.reconnect())
         else:
             self._log("* Expected disconnect, does not trigger reconn")
+            self.disconnect_expected = False
 
 
     async def unpair(self) -> None:
@@ -184,6 +185,33 @@ class BleakModule:
     def _log(self, msg: str, force_file_open: bool = True) -> None:
         if self.log is not None:
             self.log.log(msg, force_file_open)
+
+
+    async def _call_hook_async(self, hook: Callable | None, name: str) -> None:
+        if hook is None:
+            return
+        try:
+            result = hook()
+            if inspect.isawaitable(result):
+                await result
+        except Exception as exc:
+            self._log(f"[ERROR] {name} hook failed: {exc}")
+
+
+    def _call_hook_sync(self, hook: Callable | None, name: str) -> None:
+        if hook is None:
+            return
+        try:
+            result = hook()
+            if inspect.isawaitable(result):
+                try:
+                    loop = asyncio.get_running_loop()
+                except RuntimeError:
+                    asyncio.run(result)
+                else:
+                    loop.create_task(result)
+        except Exception as exc:
+            self._log(f"[ERROR] {name} hook failed: {exc}")
 
 
     @property

@@ -3,11 +3,13 @@ from __future__ import annotations
 import csv
 from datetime import datetime
 from pathlib import Path
+import sys
 from typing import Iterable
 
 from log_module import LogModule
 
 TIMESTAMP_FORMAT = "%Y-%m-%d %H:%M:%S"
+FILENAME_TIMESTAMP_FORMAT = "%Y_%m_%d_%H_%M_%S"
 
 COLUMN_ORDER = [
     "test_start",
@@ -23,6 +25,7 @@ COLUMN_ORDER = [
     "session_stop",
     "fp_deletion",
     "factory_reset",
+    "test result",
 ]
 
 RESULT_FIELDS = {
@@ -43,12 +46,13 @@ def _empty_row() -> dict[str, str]:
     row = {key: "" for key in COLUMN_ORDER}
     for key in RESULT_FIELDS:
         row[key] = "NT"
+    row["test result"] = "Fail"
     return row
 
 
 class CsvModule:
     def __init__(self, path: str | Path = "test_results.csv", log: LogModule | None = None) -> None:
-        self.path = Path(path)
+        self.path = self._resolve_path(path)
         self.log = log
         self.current_mac: str | None = None
         self.current_row: dict[str, str] | None = None
@@ -99,6 +103,7 @@ class CsvModule:
             if literal is None:
                 continue
             row[key] = literal
+        self._update_test_result(row)
         self._upsert_row(row)
 
     def finish_test(self, factory_reset_result: str | None) -> None:
@@ -109,6 +114,7 @@ class CsvModule:
         literal = self._ensure_literal(factory_reset_result, "factory_reset")
         if literal is not None:
             row["factory_reset"] = literal
+        self._update_test_result(row)
         self._upsert_row(row)
 
     def read_all(self) -> list[dict[str, str]]:
@@ -159,6 +165,7 @@ class CsvModule:
         if not mac:
             self._log("[CSV] Attempted to write row without mac_address")
             return
+        self._update_test_result(row)
         rows = self._read_rows()
         replaced = False
         for idx, existing in enumerate(rows):
@@ -174,6 +181,10 @@ class CsvModule:
         if self.log is not None:
             self.log.log(msg)
 
+    def _update_test_result(self, row: dict[str, str]) -> None:
+        all_pass = all(row.get(key) == "Pass" for key in RESULT_FIELDS)
+        row["test result"] = "Pass" if all_pass else "Fail"
+
     def _ensure_literal(self, value: str | None, field: str) -> str | None:
         if value is None:
             return "NT"
@@ -181,3 +192,30 @@ class CsvModule:
             self._log(f"[CSV] Invalid result literal for {field}: {value}")
             return None
         return value
+
+    def _resolve_path(self, path: str | Path) -> Path:
+        path = Path(path)
+        timestamp = datetime.now().strftime(FILENAME_TIMESTAMP_FORMAT)
+
+        if path.suffix.lower() == ".csv":
+            base_name = path.stem or "test_results"
+            if path.is_absolute() or path.parent != Path("."):
+                target_dir = path.parent
+            else:
+                target_dir = self._default_dir()
+        else:
+            if path.is_absolute() or path.parent != Path("."):
+                target_dir = path
+                base_name = "test_results"
+            else:
+                target_dir = self._default_dir()
+                base_name = path.name or "test_results"
+
+        return target_dir / f"{base_name}_{timestamp}.csv"
+
+    def _default_dir(self) -> Path:
+        if getattr(sys, "frozen", False):
+            base_dir = Path(sys.executable).resolve().parent
+        else:
+            base_dir = Path(__file__).resolve().parent
+        return base_dir / "csv"
