@@ -69,7 +69,7 @@ class BleakModule:
                     if self.client.is_connected:
                         self._log("* Reconn success")
                         self.disconnect_expected = False
-                        await self._call_hook_async(self.on_reconnect, "on_reconnect")
+                        asyncio.create_task(self._call_hook_async(self.on_reconnect, "on_reconnect"))
                         return
                 except Exception as exc:
                     self._log("* Reconn failed, trying again...")
@@ -83,6 +83,12 @@ class BleakModule:
             if self.reconnect_task is None or self.reconnect_task.done():
                 self._log("Unexpected disconn, try reconnection")
                 self.reconnect_task = asyncio.create_task(self.reconnect())
+            else:
+                self._log(
+                    f"[WARN] Reconnect start failed; Reconnect task is reserved" \
+                    + f" Please remove the device info by pressing 'Dongle Reset'" \
+                    + f" and manually factory reset the device"
+                )
         else:
             self._log("* Expected disconnect, does not trigger reconn")
             self.disconnect_expected = False
