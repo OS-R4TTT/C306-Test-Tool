@@ -510,6 +510,7 @@ async def _cb_event_management(sender, data):
         
         if action == "start":
             res_ev_start = "Pass"
+            log.log(f"[INFO] Start Urine")
             view.set_lamp(view.lamp_camera, "operating")
             view.set_lamp(view.lamp_event_session_start, "pass")
             view.set_lamp(view.lamp_event_session_stop, "testing")
@@ -522,6 +523,7 @@ async def _cb_event_management(sender, data):
             # we should still wait for stop event, so it does not set event
         elif action == "stop":
             res_ev_stop = "Pass"
+            log.log(f"[INFO] Stop Urine")
             view.set_lamp(view.lamp_camera, "not-operating")
             view.set_lamp(view.lamp_event_session_stop, "pass")
             view.var_event_session_stop.set("Pass")
@@ -531,6 +533,7 @@ async def _cb_event_management(sender, data):
         elif action == "cancel":
             res_ev_start = "Fail"
             res_ev_stop = "Fail"
+            log.log(f"[INFO] Cancel Urine")
             view.set_lamp(view.lamp_camera, "not-operating")
             view.set_lamp(view.lamp_event_session_start, "fail")
             view.set_lamp(view.lamp_event_session_stop, "fail")
