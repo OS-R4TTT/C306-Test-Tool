@@ -110,8 +110,18 @@ def on_disconnect() -> None:
 async def on_reconnect() -> None:
     """
     This function will run in BleakModule after it reconnects.
+    
+    This will also send "UNSET" command on reconnect.
     """
     # We don't need to start notifications on reconnect
+
+    while True:
+        try:
+            await asyncio.sleep(0.5) # slack time for consistency
+            await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
+            break
+        except:
+            pass
 
     if len(fingerprint_storage) == 0:
         view.set_state("idle-connected")
@@ -200,6 +210,8 @@ async def connect_and_read_device_info() -> bool:
         #await bleak.write_gatt_char(UUID_OHSUNG_TESTMODE_NOTIFY, bytes([0xF3]))
         #log.log(f"[INFO] Ohsung testmode command sent")
         await start_notifications()
+        #we will give "UNSET" here first when connected. This will also happen on reconnection scenarios
+        await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
         await read_device_info()
         return True
     except Exception as exc:
@@ -518,8 +530,9 @@ async def _cb_event_management(sender, data):
             view.var_event_session_stop.set("Testing...")
             csv.update_results(session_start=res_ev_start)
             await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "IN-PROGRESS".encode("utf-8"))
-            await asyncio.sleep(3.0)
-            await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
+            # originally, we sent "IN-PROGRESS" followed by "UNSET". Now we send "UNSET" on connection/reconnection.
+            #await asyncio.sleep(3.0)
+            #await bleak.write_gatt_char(UUID_EVENT_MANAGEMENT, "UNSET".encode("utf-8"))
             # we should still wait for stop event, so it does not set event
         elif action == "stop":
             res_ev_stop = "Pass"
